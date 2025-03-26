@@ -1,0 +1,21 @@
+﻿# وابستگی‌های پروژه CryptoNewsBot
+
+# کتابخانه‌های اصلی
+aiohttp==3.8.5
+asyncio==3.4.3
+sqlalchemy==2.0.20
+redis==4.6.0
+telethon==1.28.5
+beautifulsoup4==4.12.2
+tweepy==4.14.0
+langid==1.1.6
+transformers==4.30.2
+torch==2.0.1
+
+# کتابخانه‌های کمکی
+python-dotenv==1.0.0
+pydantic==2.1.1
+tenacity==8.2.3
+jdatetime==4.1.1
+schedule==1.2.0
+pytz==2023.3
