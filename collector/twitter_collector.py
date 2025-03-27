@@ -1,7 +1,9 @@
 ﻿"""
 ماژول جمع‌آوری داده از توییتر برای CryptoNewsBot
 
-این ماژول مسئول جمع‌آوری اخبار از توییتر با استفاده از کتابخانه snscrape است.
+این ماژول مسئول جمع‌آوری اخبار از توییتر با استفاده از کتابخانه tweety‑ns است.
+این کتابخانه با استفاده از توکن‌های مهمان و مهندسی معکوس API فرانت‌اند توییتر،
+بدون نیاز به API رسمی و به صورت رایگان، توییت‌ها را استخراج می‌کند.
 """
 
 import asyncio
@@ -15,8 +17,8 @@ from typing import Dict, List, Optional, Any, Tuple, Set
 from datetime import datetime, timedelta
 import hashlib
 
-# برای استفاده از snscrape بدون نصب به عنوان پکیج
-import snscrape.modules.twitter as sntwitter
+# استفاده از کتابخانه tweety‑ns به‌عنوان ابزار اصلی استخراج توییت‌ها
+from tweety import TwitterAsync
 
 from ..utils.config import Config
 from ..utils.logger import Logger
@@ -34,8 +36,8 @@ class TwitterCollector:
     کلاس جمع‌آوری داده‌ها از توییتر
 
     این کلاس مسئول جمع‌آوری توییت‌ها از کاربران و هشتگ‌های مرتبط با ارزهای دیجیتال است.
-    به جای استفاده از API رسمی توییتر که نیاز به کلید و هزینه دارد، از کتابخانه snscrape
-    استفاده می‌کند که یک ابزار اسکرپینگ رایگان است.
+    به جای استفاده از API رسمی توییتر که نیاز به کلید و هزینه دارد، از کتابخانه tweety‑ns استفاده می‌کند
+    که یک ابزار اسکرپینگ به‌روز و رایگان برای توییتر محسوب می‌شود.
     """
 
     def __init__(self) -> None:
@@ -55,7 +57,7 @@ class TwitterCollector:
         self.max_tweets_per_query = 100
         self.days_limit = 3  # حداکثر تعداد روز برای جمع‌آوری توییت‌های قدیمی‌تر
 
-        # کلید‌های ذخیره در ردیس
+        # کلید‌های ذخیره در Redis
         self.last_tweet_id_prefix = "twitter:last_tweet_id:"
         self.processed_tweets_key = "twitter:processed_tweets"
 
@@ -104,23 +106,26 @@ class TwitterCollector:
         key = f"{self.last_tweet_id_prefix}{query_key}"
         self.redis.set(key, tweet_id)
 
-    async def process_tweet(self, tweet) -> Optional[Dict[str, Any]]:
+    async def process_tweet(self, tweet: Any) -> Optional[Dict[str, Any]]:
         """
         پردازش یک توییت و استخراج اطلاعات آن
 
         Args:
-            tweet: شیء توییت از snscrape
+            tweet: شیء توییت از tweety‑ns
 
         Returns:
             اطلاعات پردازش شده توییت یا None
         """
         try:
-            # بررسی توییت خالی
-            if not tweet.content:
+            # استفاده از tweet.text به عنوان محتوای توییت
+            tweet_text = getattr(tweet, 'text', None)
+            if not tweet_text:
                 return None
 
             # تبدیل شناسه توییت به رشته
-            tweet_id = str(tweet.id)
+            tweet_id = str(getattr(tweet, 'id', None))
+            if not tweet_id:
+                return None
 
             # بررسی پردازش قبلی
             if await self.is_processed_tweet(tweet_id):
@@ -130,66 +135,81 @@ class TwitterCollector:
             await self.mark_tweet_processed(tweet_id)
 
             # تمیز کردن متن
-            cleaned_text = clean_text(tweet.content)
+            cleaned_text = clean_text(tweet_text)
 
-            # بررسی طول متن
-            if len(cleaned_text) < 10:  # رد توییت‌های خیلی کوتاه
+            # رد توییت‌های خیلی کوتاه
+            if len(cleaned_text) < 10:
                 return None
 
             # محاسبه هش متن برای تشخیص تکرار
             text_hash = compute_similarity_hash(cleaned_text)
 
-            # بررسی تکراری بودن متن
+            # بررسی تکراری بودن متن در دیتابیس
             if self.db.is_duplicate_news(cleaned_text):
                 return None
 
-            # استخراج URL‌ها، هشتگ‌ها و منشن‌ها
-            urls = []
-            for url in tweet.outlinks or []:
-                if url and "twitter.com" not in url:  # حذف لینک‌های داخلی توییتر
-                    urls.append(url)
+            # استخراج URLها، هشتگ‌ها و منشن‌ها (در صورت وجود)
+            urls = getattr(tweet, 'urls', [])
+            urls = [url for url in urls if url and "twitter.com" not in url]
 
-            # استخراج هشتگ‌ها
-            hashtags = [tag.lower() for tag in (tweet.hashtags or [])]
+            hashtags = [tag.lower() for tag in getattr(tweet, 'hashtags', [])]
 
-            # استخراج منشن‌ها
-            mentions = tweet.mentionedUsers or []
+            mentions = getattr(tweet, 'mentions', [])
             mentioned_usernames = [user.username for user in mentions] if mentions else []
 
-            # بررسی و استخراج تصاویر
+            # بررسی و استخراج رسانه (در صورت وجود)
             media_urls = []
             has_media = False
+            if hasattr(tweet, 'media') and tweet.media:
+                for item in tweet.media:
+                    if hasattr(item, 'url'):
+                        media_urls.append(item.url)
+                        has_media = True
 
-            if hasattr(tweet, 'media'):
-                media = tweet.media
-                if media:
-                    for item in media:
-                        if hasattr(item, 'fullUrl'):
-                            media_urls.append(item.fullUrl)
-                            has_media = True
+            # تعیین تاریخ انتشار
+            published_at = getattr(tweet, 'date', None)
+            if not published_at:
+                published_at = getattr(tweet, 'created_at', datetime.utcnow())
 
-            # ساخت شیء توییت
+            # دریافت اطلاعات کاربری
+            user = getattr(tweet, 'user', None)
+            if user is None:
+                # در صورت عدم وجود اطلاعات کاربری، از مقادیر پیش‌فرض استفاده می‌شود
+                user = type('User', (), {})()
+                user.username = "unknown"
+                user.id = 0
+                user.displayname = "unknown"
+                user.followersCount = 0
+                user.verified = False
+
+            # استخراج آمارهای توییت (در صورت وجود)
+            retweet_count = getattr(tweet, 'retweet_count', 0)
+            like_count = getattr(tweet, 'like_count', 0)
+            reply_count = getattr(tweet, 'reply_count', 0)
+            quote_count = getattr(tweet, 'quote_count', 0)
+            is_retweet = getattr(tweet, 'is_retweet', False)
+
             tweet_data = {
                 "external_id": tweet_id,
                 "source": NewsSource.TWITTER.value,
-                "source_name": tweet.user.username,
+                "source_name": user.username,
                 "text": cleaned_text,
-                "title": None,  # توییتر عنوان ندارد
-                "url": f"https://twitter.com/{tweet.user.username}/status/{tweet_id}",
+                "title": None,  # توییتر عنوانی ندارد
+                "url": f"https://twitter.com/{user.username}/status/{tweet_id}",
                 "has_media": has_media,
                 "media_urls": media_urls if media_urls else None,
-                "published_at": tweet.date,
+                "published_at": published_at,
                 "meta": {
-                    "user_id": tweet.user.id,
-                    "user_name": tweet.user.username,
-                    "user_display_name": tweet.user.displayname,
-                    "user_followers": getattr(tweet.user, 'followersCount', 0),
-                    "user_verified": getattr(tweet.user, 'verified', False),
-                    "retweet_count": getattr(tweet, 'retweetCount', 0),
-                    "like_count": getattr(tweet, 'likeCount', 0),
-                    "reply_count": getattr(tweet, 'replyCount', 0),
-                    "quote_count": getattr(tweet, 'quoteCount', 0),
-                    "is_retweet": getattr(tweet, 'isRetweet', False),
+                    "user_id": user.id,
+                    "user_name": user.username,
+                    "user_display_name": user.displayname,
+                    "user_followers": getattr(user, 'followersCount', 0),
+                    "user_verified": getattr(user, 'verified', False),
+                    "retweet_count": retweet_count,
+                    "like_count": like_count,
+                    "reply_count": reply_count,
+                    "quote_count": quote_count,
+                    "is_retweet": is_retweet,
                     "urls": urls,
                     "hashtags": hashtags,
                     "mentions": mentioned_usernames,
@@ -214,7 +234,6 @@ class TwitterCollector:
             وضعیت ذخیره‌سازی
         """
         try:
-            # افزودن به دیتابیس
             raw_news = self.db.add_raw_news(
                 external_id=tweet_data["external_id"],
                 source=tweet_data["source"],
@@ -235,68 +254,54 @@ class TwitterCollector:
             self.logger.error(f"خطا در ذخیره توییت {tweet_data['external_id']}: {str(e)}")
             return False
 
-    def _build_search_query(self, query_term: str, since_id: Optional[str] = None, days_limit: int = None) -> str:
+    def _compute_since_date(self, days_limit: Optional[int]) -> str:
         """
-        ساخت کوئری جستجو برای snscrape
+        محاسبه تاریخ شروع برای جمع‌آوری توییت‌ها بر اساس محدودیت روز
 
         Args:
-            query_term: عبارت جستجو (کاربر یا هشتگ)
-            since_id: شناسه آخرین توییت (اختیاری)
-            days_limit: محدودیت روز (اختیاری)
+            days_limit: تعداد روز
 
         Returns:
-            کوئری جستجو
+            تاریخ به فرمت 'YYYY-MM-DD'
         """
-        # بررسی نوع کوئری
-        if query_term.startswith('@'):
-            # جستجو بر اساس کاربر
-            username = query_term[1:]
-            query = f"from:{username}"
-        elif query_term.startswith('#'):
-            # جستجو بر اساس هشتگ
-            hashtag = query_term[1:]
-            query = f"#{hashtag}"
-        else:
-            # جستجوی عادی
-            query = query_term
+        since_date = (now() - timedelta(days=days_limit)).strftime('%Y-%m-%d')
+        return since_date
 
-        # اضافه کردن محدودیت زمانی
-        if days_limit is not None:
-            since_date = (now() - timedelta(days=days_limit)).strftime('%Y-%m-%d')
-            query += f" since:{since_date}"
-
-        # اضافه کردن محدودیت زبان (اختیاری)
-        # query += " lang:en OR lang:fa"
-
-        # حذف ریتوییت‌ها
-        query += " -filter:retweets"
-
-        return query
-
-    async def _collect_tweets_with_snscrape(self, query: str, max_tweets: int) -> List[Any]:
+    async def _collect_tweets_with_tweety(self, query: str, max_tweets: int) -> List[Any]:
         """
-        جمع‌آوری توییت‌ها با استفاده از snscrape
+        جمع‌آوری توییت‌ها با استفاده از کتابخانه tweety‑ns
 
         Args:
-            query: کوئری جستجو
+            query: عبارت جستجو (کاربر یا هشتگ)
             max_tweets: حداکثر تعداد توییت
 
         Returns:
             لیست توییت‌ها
         """
         tweets = []
+        app = TwitterAsync()  # ایجاد نمونه TwitterAsync
 
-        # استفاده از scraper توییتر
-        scraper = sntwitter.TwitterSearchScraper(query)
+        since_date = self._compute_since_date(self.days_limit)
 
-        # محدود کردن تعداد توییت‌ها
-        for i, tweet in enumerate(scraper.get_items()):
-            if i >= max_tweets:
-                break
-            tweets.append(tweet)
+        try:
+            if query.startswith('@'):
+                username = query[1:]
+                tweets_data = await app.get_tweets(username=username, since=since_date, limit=max_tweets)
+            elif query.startswith('#'):
+                hashtag = query[1:]
+                tweets_data = await app.get_tweets(hashtag=hashtag, since=since_date, limit=max_tweets)
+            else:
+                tweets_data = await app.get_tweets(query=query, since=since_date, limit=max_tweets)
 
-        self.logger.info(f"تعداد {len(tweets)} توییت برای کوئری '{query}' جمع‌آوری شد")
-        return tweets
+            for tweet in tweets_data:
+                tweets.append(tweet)
+
+            self.logger.info(f"تعداد {len(tweets)} توییت برای کوئری '{query}' جمع‌آوری شد")
+            return tweets
+
+        except Exception as e:
+            self.logger.error(f"خطا در جمع‌آوری توییت‌ها با tweety برای '{query}': {str(e)}")
+            return tweets
 
     @retry(max_tries=3, delay=5, backoff=2)
     async def collect_from_twitter(self, query_term: str) -> Tuple[int, int]:
@@ -313,46 +318,32 @@ class TwitterCollector:
         saved_count = 0
 
         try:
-            # تبدیل نام کاربری به فرمت مناسب
-            query_key = query_term.replace('@', '').replace('#', '')
+            query_key = query_term.lstrip('@#')
 
-            # دریافت شناسه آخرین توییت
-            last_tweet_id = await self.get_last_tweet_id(query_key)
-
-            # ساخت کوئری جستجو
-            search_query = self._build_search_query(query_term, last_tweet_id, self.days_limit)
-
-            # جمع‌آوری توییت‌ها
-            tweets = await self._collect_tweets_with_snscrape(search_query, self.max_tweets_per_query)
+            # در tweety‑ns معمولاً استفاده از last_tweet_id برای فیلتر اضافی ضروری نیست؛
+            # در اینجا از محدودیت زمانی days_limit بهره می‌بریم.
+            tweets = await self._collect_tweets_with_tweety(query_term, self.max_tweets_per_query)
 
             if not tweets:
                 self.logger.info(f"هیچ توییت جدیدی برای '{query_term}' یافت نشد")
                 return 0, 0
 
-            # مرتب‌سازی توییت‌ها بر اساس تاریخ (جدید به قدیم)
-            tweets.sort(key=lambda x: x.date, reverse=True)
+            tweets.sort(key=lambda x: getattr(x, 'date', getattr(x, 'created_at', datetime.utcnow())), reverse=True)
 
-            # ذخیره شناسه جدیدترین توییت
-            newest_id = str(tweets[0].id)
+            newest_id = str(getattr(tweets[0], 'id', ''))
             await self.set_last_tweet_id(query_key, newest_id)
 
-            # پردازش و ذخیره توییت‌ها
             for tweet in tweets:
                 processed_count += 1
-
-                # پردازش توییت
                 tweet_data = await self.process_tweet(tweet)
-
                 if tweet_data:
-                    # ذخیره توییت
                     if await self.save_tweet(tweet_data):
                         saved_count += 1
-
-                # تأخیر کوتاه برای کاهش بار
                 await asyncio.sleep(0.1)
 
             self.logger.info(
-                f"جمع‌آوری از '{query_term}' پایان یافت. پردازش‌شده: {processed_count}, ذخیره‌شده: {saved_count}")
+                f"جمع‌آوری از '{query_term}' پایان یافت. پردازش‌شده: {processed_count}, ذخیره‌شده: {saved_count}"
+            )
             return processed_count, saved_count
 
         except Exception as e:
@@ -373,17 +364,13 @@ class TwitterCollector:
         results = {}
 
         for account in accounts_to_collect:
-            # اضافه کردن @ به ابتدای نام کاربری اگر نداشته باشد
             if not account.startswith('@'):
                 account = f"@{account}"
 
             try:
                 processed, saved = await self.collect_from_twitter(account)
                 results[account] = (processed, saved)
-
-                # تأخیر بین حساب‌ها
                 await asyncio.sleep(2)
-
             except Exception as e:
                 self.logger.error(f"خطا در جمع‌آوری از حساب {account}: {str(e)}")
                 results[account] = (0, 0)
@@ -404,25 +391,20 @@ class TwitterCollector:
         results = {}
 
         for hashtag in hashtags_to_collect:
-            # اضافه کردن # به ابتدای هشتگ اگر نداشته باشد
             if not hashtag.startswith('#'):
                 hashtag = f"#{hashtag}"
 
             try:
                 processed, saved = await self.collect_from_twitter(hashtag)
                 results[hashtag] = (processed, saved)
-
-                # تأخیر بین هشتگ‌ها
                 await asyncio.sleep(2)
-
             except Exception as e:
                 self.logger.error(f"خطا در جمع‌آوری از هشتگ {hashtag}: {str(e)}")
                 results[hashtag] = (0, 0)
 
         return results
 
-    async def run(self, accounts: Optional[List[str]] = None, hashtags: Optional[List[str]] = None) -> Dict[
-        str, Dict[str, Tuple[int, int]]]:
+    async def run(self, accounts: Optional[List[str]] = None, hashtags: Optional[List[str]] = None) -> Dict[str, Dict[str, Tuple[int, int]]]:
         """
         اجرای جمع‌کننده توییتر
 
@@ -439,11 +421,8 @@ class TwitterCollector:
         }
 
         try:
-            # جمع‌آوری از حساب‌های کاربری
             if accounts or self.accounts:
                 results["accounts"] = await self.collect_from_accounts(accounts)
-
-            # جمع‌آوری از هشتگ‌ها
             if hashtags or self.hashtags:
                 results["hashtags"] = await self.collect_from_hashtags(hashtags)
 

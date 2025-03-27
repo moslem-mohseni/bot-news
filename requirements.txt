@@ -19,3 +19,4 @@ tenacity==8.2.3
 jdatetime==4.1.1
 schedule==1.2.0
 pytz==2023.3
+tweety-ns
